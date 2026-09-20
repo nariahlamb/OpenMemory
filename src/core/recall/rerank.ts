@@ -175,11 +175,16 @@ export function prepare_evidence_query(text: string, nodes: readonly HydroNode[]
     const subject_terms = new Set(subject ? evidence_tokens(subject) : []);
     const terms = new Set(evidence_tokens(exclusion ? text.slice(0, exclusion.index) : text)
         .filter((term) => !subject_terms.has(term) && !generic_terms.has(term)));
+    // a named third party's history is scattered across many turns; searching it narrowly
+    // and keeping only the single closest lexical match misses the other facts a real
+    // question about that person needs, so treat it the same as an explicit list/count query.
+    const named_subject_query = subject !== null && subject !== 'user';
     return {
         subject, terms, excluded,
-        aggregate: /\b(?:how many|list|which (?:items|events|activities|places)|what activities)\b/i.test(text),
+        aggregate: named_subject_query || /\b(?:how many|list|which (?:items|events|activities|places)|what activities)\b/i.test(text),
     };
 }
+
 
 export function evidence_support(query: evidence_query, node: HydroNode): evidence_features {
     const document = evidence_document_of(node);

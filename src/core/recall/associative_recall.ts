@@ -38,6 +38,9 @@ import { matrix_fusion, select_sparse_seeds } from './matrix_fusion.js';
 import { default_rerank_depth, prepare_rerank_query, rerank_features, rerank_score, prepare_evidence_query, evidence_support, evidence_adjustment, order_evidence, query_calendar_window, calendar_relevance } from './rerank.js';
 
 const day_ms = 86_400_000;
+// aggregate/list questions ("besides X, what else", "how many") need a wider candidate
+// window than point queries: the omitted facts rarely share the query's dominant terms.
+const aggregate_rerank_depth = 200;
 const length_prior_saturation = 8;
 // pseudo-relevance feedback drifts the query when the top-10 are wrong; opt in with OM_RM3=1
 const rm3_enabled = process.env.OM_RM3 === '1';
@@ -244,6 +247,7 @@ function polarity_relevance(node: HydroNode, enabled: boolean, query_terms: read
 
 const referential_turn_re = /\b(?:did it|did that|just did it|just did that|that one|this one|the same (?:thing|place|one)|so did i|me too)\b/i;
 const pronoun_turn_re = /^(?:[^:\n]{1,32}:\s+)?(?:it|he|she|they|this|that|those|these)\b/i;
+const question_turn_re = /\?\s*$/;
 const aggregate_query_re = /\b(?:how many|total|list|which (?:items|events|activities|places)|what activities|all (?:the |of )?(?:items|events|activities|places))\b/i;
 
 function conversation_bundles(
@@ -252,27 +256,49 @@ function conversation_bundles(
     edges: readonly HydroEdge[],
     anchor_limit = 8,
     max_depth = 2,
-): Map<string, readonly HydroNode[]> {
+): { bundles: Map<string, readonly HydroNode[]>; forward_ids: Set<string> } {
     const by_id = new Map(nodes.map((node) => [node.id, node]));
     const predecessor = new Map<string, string>();
-    for (const edge of edges) if (edge.type === 'refers_to') predecessor.set(edge.from, edge.to);
+    const successor = new Map<string, string>();
+    for (const edge of edges) if (edge.type === 'refers_to') {
+        predecessor.set(edge.from, edge.to);
+        // a ranked turn that is itself the question, not the reply, needs its answer pulled
+        // forward: the reply is whichever later turn's refers_to edge points back at it.
+        if (!successor.has(edge.to)) successor.set(edge.to, edge.from);
+    }
     const bundles = new Map<string, readonly HydroNode[]>();
+    const forward_ids = new Set<string>();
     for (const anchor of anchors.slice(0, anchor_limit)) {
         const explicit = referential_turn_re.test(anchor.node.content.raw);
-        if (!explicit && !(anchor.node.content.raw.length <= 512 && pronoun_turn_re.test(anchor.node.content.raw))) continue;
+        const is_question = question_turn_re.test(anchor.node.content.raw);
+        if (!explicit && !is_question && !(anchor.node.content.raw.length <= 512 && pronoun_turn_re.test(anchor.node.content.raw))) continue;
         const conversation = conversation_of(anchor.node);
         if (!conversation) continue;
         const neighbours: HydroNode[] = [];
         const visited = new Set([anchor.node.id]);
         let tokens = 0;
+        const same_scope = (candidate: HydroNode) => conversation_of(candidate) === conversation
+            && candidate.world.world_id === anchor.node.world.world_id
+            && candidate.metadata.user_id === anchor.node.metadata.user_id;
+        if (is_question) {
+            let current = anchor.node.id;
+            for (let depth = 0; depth < max_depth; depth++) {
+                const next_id = successor.get(current);
+                const next = next_id ? by_id.get(next_id) : undefined;
+                if (!next || visited.has(next.id) || !same_scope(next) || next.temporal.observed_at < anchor.node.temporal.observed_at) break;
+                visited.add(next.id);
+                tokens += count_tokens(memory_evidence_text(next, { prefer_raw: true }));
+                if (tokens > 256) break;
+                neighbours.push(next);
+                forward_ids.add(next.id);
+                current = next.id;
+            }
+        }
         let current = anchor.node.id;
         for (let depth = 0; depth < max_depth; depth++) {
             const previous_id = predecessor.get(current);
             const previous = previous_id ? by_id.get(previous_id) : undefined;
-            if (!previous || visited.has(previous.id) || conversation_of(previous) !== conversation
-                || previous.world.world_id !== anchor.node.world.world_id
-                || previous.metadata.user_id !== anchor.node.metadata.user_id
-                || previous.temporal.observed_at > anchor.node.temporal.observed_at) break;
+            if (!previous || visited.has(previous.id) || !same_scope(previous) || previous.temporal.observed_at > anchor.node.temporal.observed_at) break;
             visited.add(previous.id);
             tokens += count_tokens(memory_evidence_text(previous, { prefer_raw: true }));
             if (!explicit && tokens > 256) break;
@@ -281,7 +307,7 @@ function conversation_bundles(
         }
         if (neighbours.length > 0) bundles.set(anchor.node.id, neighbours);
     }
-    return bundles;
+    return { bundles, forward_ids };
 }
 
 
@@ -461,6 +487,12 @@ export function associative_recall(
     }
 
 
+    // computed early (not just at rerank time) so aggregate/list queries can widen the
+    // candidate window before the initial top-K cut discards distinct-but-lower-scoring facts.
+    const evidence_enabled = process.env.LONGMEMORY_EVIDENCE_RERANK !== '0';
+    const evidence_query = evidence_enabled ? prepare_evidence_query(query.text, admitted) : null;
+    const rerank_depth = evidence_query?.aggregate ? Math.max(default_rerank_depth, aggregate_rerank_depth) : default_rerank_depth;
+
     const documents = admitted.map((node) => recall_document(node));
     const bm25 = bm25_scores(plan.intent.terms, documents);
     const prepared_query = recall_vector(query_vector);
@@ -570,7 +602,7 @@ export function associative_recall(
     const rerank_query = prepare_rerank_query(recall_tokens(query.text));
     const calendar = process.env.LONGMEMORY_CALENDAR_RERANK !== '0' ? query_calendar_window(query.text) : null;
     const candidate_limit = limit === null || limit === 0 || rerank_query.terms.length === 0
-        ? limit : Math.max(limit, default_rerank_depth);
+        ? limit : Math.max(limit, rerank_depth);
     const ranked_entries: Array<{ item: AssociativeItem; order: number }> = [];
     for (let node_index = 0; node_index < admitted.length; node_index++) {
         const node = admitted[node_index];
@@ -585,8 +617,10 @@ export function associative_recall(
         const polarity = polarity_scores[node_index];
         const entity_gate = entity_gates[node_index];
         const label = status_label_for(node, min_confidence);
+        // an unresolved contradiction is exactly the evidence an "did X always go smoothly"
+        // question wants surfaced, so exception queries don't pay the usual reliability penalty for it.
         const status_penalty =
-            label === 'superseded' || label === 'contradicted' ? weights.status_penalty : 0;
+            label === 'superseded' || (label === 'contradicted' && !exception_query) ? weights.status_penalty : 0;
         const fusion = fusion_scores[node_index];
         const recency = recency_scores[node_index];
         const session = session_scores?.get(conversation_of(node)) ?? 0;
@@ -658,11 +692,9 @@ export function associative_recall(
 
     if (limit === null) ranked_entries.sort((left, right) => right.item.score - left.item.score || left.order - right.order);
     const ranked = ranked_entries.map((entry) => entry.item);
-    const evidence_enabled = process.env.LONGMEMORY_EVIDENCE_RERANK !== '0';
-    const evidence_query = evidence_enabled ? prepare_evidence_query(query.text, admitted) : null;
 
     if (rerank_query.terms.length > 0 && ranked.length > 1) {
-        const head = ranked.slice(0, Math.min(default_rerank_depth, ranked.length));
+        const head = ranked.slice(0, Math.min(rerank_depth, ranked.length));
         let strongest: AssociativeItem | undefined;
         let strongest_score = -Infinity;
         for (const item of head) {
@@ -706,10 +738,10 @@ export function associative_recall(
         similarity: (left, right) => memory_similarity(left.node, right.node),
     });
     if (limit !== null) diverse.splice(limit);
-    const bundles = matrix_retrieval_enabled && deps.edges?.length
+    const { bundles, forward_ids } = matrix_retrieval_enabled && deps.edges?.length
         ? conversation_bundles(diverse, admitted, deps.edges)
-        : new Map<string, readonly HydroNode[]>();
-    const context = build_context_packet(diverse, query.token_budget ?? Number.POSITIVE_INFINITY, { query_terms: plan.intent.terms, bundles });
+        : { bundles: new Map<string, readonly HydroNode[]>(), forward_ids: new Set<string>() };
+    const context = build_context_packet(diverse, query.token_budget ?? Number.POSITIVE_INFINITY, { query_terms: plan.intent.terms, bundles, forward_bundle_ids: forward_ids });
     const included_ids = new Set(context.items.map((n) => n.id));
 
     for (const item of ranked) {
@@ -763,7 +795,7 @@ export function associative_recall(
         cold_scans: deps.index.cold_scans,
         evidence_rerank: {
             enabled: evidence_enabled,
-            candidates: rerank_query.terms.length > 0 && ranked_entries.length > 1 ? Math.min(default_rerank_depth, ranked_entries.length) : 0,
+            candidates: rerank_query.terms.length > 0 && ranked_entries.length > 1 ? Math.min(rerank_depth, ranked_entries.length) : 0,
             subject: evidence_query?.subject ?? null,
             aggregate: evidence_query?.aggregate ?? false,
         },

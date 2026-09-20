@@ -95,8 +95,14 @@ function relation_edge(type: string, from: string, to: string, at: number): Hydr
     });
 }
 
-function latest_claim(node: HydroNode): ExtractedClaim | undefined {
-    return node.content.claims?.[0] ?? extract_claims(node.content.raw)[0];
+function node_claims(node: HydroNode): readonly ExtractedClaim[] {
+    return node.content.claims ?? extract_claims(node.content.raw);
+}
+
+// unlike claims[0], resolves the specific claim a topic key was registered from,
+// so a turn with several clauses reconciles each one against its own history.
+function claim_by_topic(node: HydroNode, topic: string): ExtractedClaim | undefined {
+    return node_claims(node).find((claim) => claim.topic === topic);
 }
 
 function relationship_key(world_id: string, user_id: unknown, value: string): string {
@@ -401,19 +407,25 @@ export class IngestEngine {
     ): HydroEdge[] {
         this.ensure_relationship_indexes();
         const edges: HydroEdge[] = [];
-        const incoming = parsed.claims[0];
         const behavior = parsed.event.conflict_behavior ?? 'auto';
-        if (incoming && behavior !== 'none') {
-            const related_id = this.current_claim_nodes.get(relationship_key(draft.world.world_id, parsed.event.user_id, incoming.topic));
-            const related_node = related_id ? this.graph.get_node(related_id) : undefined;
-            const related_claim = related_node ? latest_claim(related_node) : undefined;
-            if (related_node && related_claim && related_node.state.status === 'active' && related_node.temporal.superseded_at === null
-                && (behavior !== 'auto' || parsed.valid_from >= related_node.temporal.valid_from)
-                && claims_conflict(incoming, related_claim)) {
-                const type = behavior === 'supersede' ? 'supersedes'
-                    : behavior === 'contradict' ? 'contradicts'
-                        : incoming.kind === 'preference' || parsed.zone === 'exocortex' ? 'supersedes' : 'contradicts';
-                edges.push(relation_edge(type, draft.id, related_node.id, parsed.at));
+        if (behavior !== 'none') {
+            // check every claim extracted from the turn, not just the first one, so a
+            // clause after the opening sentence still reconciles against prior history.
+            const conflicted_targets = new Set<string>();
+            for (const incoming of parsed.claims) {
+                const related_id = this.current_claim_nodes.get(relationship_key(draft.world.world_id, parsed.event.user_id, incoming.topic));
+                if (!related_id || conflicted_targets.has(related_id)) continue;
+                const related_node = this.graph.get_node(related_id);
+                const related_claim = related_node ? claim_by_topic(related_node, incoming.topic) : undefined;
+                if (related_node && related_claim && related_node.state.status === 'active' && related_node.temporal.superseded_at === null
+                    && (behavior !== 'auto' || parsed.valid_from >= related_node.temporal.valid_from)
+                    && claims_conflict(incoming, related_claim)) {
+                    const type = behavior === 'supersede' ? 'supersedes'
+                        : behavior === 'contradict' ? 'contradicts'
+                            : incoming.kind === 'preference' || parsed.zone === 'exocortex' ? 'supersedes' : 'contradicts';
+                    edges.push(relation_edge(type, draft.id, related_node.id, parsed.at));
+                    conflicted_targets.add(related_id);
+                }
             }
         }
         if (parsed.zone === 'endocortex' && grounding) {
@@ -430,15 +442,18 @@ export class IngestEngine {
     }
 
     private register_relationship_node(node: HydroNode): void {
-        const claim = latest_claim(node);
-        if (claim && node.state.status === 'active' && node.temporal.superseded_at === null) {
-            const key = relationship_key(node.world.world_id, node.metadata.user_id ?? node.provenance.created_by, claim.topic);
-            const prior_id = this.current_claim_nodes.get(key);
-            const prior = prior_id ? this.graph.get_node(prior_id) : undefined;
-            if (!prior || prior.state.status !== 'active' || prior.temporal.superseded_at !== null
-                || prior.temporal.valid_from < node.temporal.valid_from
-                || (prior.temporal.valid_from === node.temporal.valid_from && prior.temporal.observed_at <= node.temporal.observed_at)) {
-                this.current_claim_nodes.set(key, node.id);
+        // register every claim the node carries as the "current" pointer for its topic,
+        // not just the first one, so later clauses remain reachable for future reconciliation.
+        if (node.state.status === 'active' && node.temporal.superseded_at === null) {
+            for (const claim of node_claims(node)) {
+                const key = relationship_key(node.world.world_id, node.metadata.user_id ?? node.provenance.created_by, claim.topic);
+                const prior_id = this.current_claim_nodes.get(key);
+                const prior = prior_id ? this.graph.get_node(prior_id) : undefined;
+                if (!prior || prior.state.status !== 'active' || prior.temporal.superseded_at !== null
+                    || prior.temporal.valid_from < node.temporal.valid_from
+                    || (prior.temporal.valid_from === node.temporal.valid_from && prior.temporal.observed_at <= node.temporal.observed_at)) {
+                    this.current_claim_nodes.set(key, node.id);
+                }
             }
         }
         if (node.world.zone === 'exocortex' && node.grounding.worlddb_ref) this.grounding_nodes.set(node.grounding.worlddb_ref, node.id);

@@ -49,6 +49,9 @@ export type ContextPacket = {
 export type context_packet_options = {
     query_terms?: readonly string[];
     bundles?: ReadonlyMap<string, readonly HydroNode[]>;
+    // bundle members normally must precede their anchor; this allow-lists the specific
+    // node ids a caller has already verified as an immediate, same-exchange reply.
+    forward_bundle_ids?: ReadonlySet<string>;
 };
 
 
@@ -78,7 +81,7 @@ export function build_context_packet(
             .filter((node) => node.id !== candidate.node.id && node.world.world_id === candidate.node.world.world_id
                 && (node.metadata.user_id ?? node.provenance.created_by) === (candidate.node.metadata.user_id ?? candidate.node.provenance.created_by)
                 && node.metadata.conversation_id === candidate.node.metadata.conversation_id
-                && node.temporal.observed_at <= candidate.node.temporal.observed_at)
+                && (node.temporal.observed_at <= candidate.node.temporal.observed_at || options.forward_bundle_ids?.has(node.id)))
             .map((node) => [node.id, node])).values()];
         let item_evidence = render(candidate.node, bundle.length > 0);
         let evidence_items = [...bundle.map((node) => render(node, true)), item_evidence];

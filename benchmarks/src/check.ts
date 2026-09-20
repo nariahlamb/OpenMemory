@@ -198,6 +198,13 @@ try {
     const dated = associative_recall({ text: 'What did Mira attend in March 2024?', now: Date.UTC(2024, 7, 1), k: 5, vector: [1, 0] }, { index: ranking_engine.index });
     assert.deepEqual(dated.context.items.map((node) => node.id), dated.items.map((item) => item.node.id));
     assert.ok(dated.items.some((item) => (item.breakdown.calendar_adjustment ?? 0) > 0));
+    const qa_memory = create_memory({ store: 'memory', embedding_dimension: 2 });
+    const qa_scope = { user_id: 'evan', conversation_id: 'chat', world: 'qa-bundle', vector: [1, 0] as number[] };
+    await qa_memory.ingest({ ...qa_scope, speaker: 'Evan', text: 'Hey Sam, what helps you relieve stress these days?', at: 1, observed_at: 1 });
+    const sam_reply = await qa_memory.ingest({ ...qa_scope, speaker: 'Sam', text: 'Honestly, yoga and long walks with unhealthy snacks after.', at: 2, observed_at: 2 });
+    const qa_result = await qa_memory.recall({ text: 'What helps Sam relieve stress?', mode: 'associative', world_id: sam_reply.node.world.world_id, k: 5, token_budget: Number.POSITIVE_INFINITY });
+    assert.ok('context' in qa_result && qa_result.context.text.includes('unhealthy snacks'));
+    await qa_memory.close();
     const nvidia = load_embedding_environment({ LONGMEMORY_EMBEDDING_PROVIDER: 'nvidia', NVIDIA_API_KEY: 'mock-nvidia-key', LONGMEMORY_EMBEDDING_MAX_RETRIES: '0' })!;
     assert.equal(nvidia.dimension, 2048);
     assert.equal(nvidia.nvidia_model, 'nvidia/nemotron-3-embed-1b');
@@ -370,6 +377,17 @@ try {
     const after_explicit = history.ingest({ user_id: 'temporal', text: 'I prefer milk.', vector: [1, 0], at: 700 });
     assert.equal(after_explicit.edges.find((edge) => edge.type === 'supersedes')?.to, explicit.node.id);
 
+    // a turn's later clauses must reconcile too, not just its first extracted claim.
+    const multi_clause = new ingest_engine();
+    const clause_first = multi_clause.ingest({ user_id: 'loc', text: 'Mira is in Oslo.', vector: [1, 0], at: 1 });
+    const clause_second = multi_clause.ingest({ user_id: 'loc', text: 'The weather is nice. Mira is in Rome.', vector: [1, 0], at: 2, conflict_behavior: 'supersede' });
+    assert.equal(clause_second.edges.find((edge) => edge.type === 'supersedes')?.to, clause_first.node.id);
+    const clause_third = multi_clause.ingest({ user_id: 'loc', text: 'Mira is in Berlin.', vector: [1, 0], at: 3, conflict_behavior: 'supersede' });
+    assert.equal(clause_third.edges.find((edge) => edge.type === 'supersedes')?.to, clause_second.node.id);
+    assert.equal(multi_clause.graph.get_node(clause_first.node.id)?.state.status, 'superseded');
+    assert.equal(multi_clause.graph.get_node(clause_second.node.id)?.state.status, 'superseded');
+    assert.equal(multi_clause.graph.get_node(clause_third.node.id)?.state.status, 'active');
+
     let render_passes = 0;
     const tracked = { ...later.node, content: { ...later.node.content, get claims() { render_passes++; return later.node.content.claims; } } };
     const rendered = build_context_packet([{ node: tracked }], 1000);
@@ -384,6 +402,12 @@ try {
     assert.deepEqual(isolated.evidence[0].sources?.map((source) => source.id), [recorded.node.id, later.node.id]);
     assert.ok(!isolated.text.includes('Other session'));
     assert.ok(!isolated.text.includes('Future source'));
+    // a future node is only admitted when the caller explicitly vouches for it as a verified reply.
+    const allowed_forward = build_context_packet([{ node: later.node }], 1000, {
+        bundles: new Map([[later.node.id, [future_source]]]),
+        forward_bundle_ids: new Set([future_source.id]),
+    });
+    assert.ok(allowed_forward.text.includes('Future source'));
     const historical_owner = { ...recorded.node, metadata: { ...recorded.node.metadata, user_id: undefined }, provenance: { ...recorded.node.provenance, created_by: 'different-owner' } };
     assert.equal(build_context_packet([{ node: later.node }], 1000, { bundles: new Map([[later.node.id, [historical_owner]]]) }).bundled_items, 0);
 
